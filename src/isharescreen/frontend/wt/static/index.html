@@ -156,7 +156,11 @@ function setStatus(msg, klass) {
   // failure (the bar is the only carrier of state when stats are
   // hidden, since errors auto-pop the bar into view).
   topbar.classList.toggle("err", klass === "err");
-  if (klass === "err") topbar.classList.add("show");
+  if (klass === "err") {
+    topbar.classList.add("show");
+    // Report only the connection-error status, never screen or input content.
+    srvLog("error", String(msg).slice(0, 300));
+  }
 }
 
 // Top bar behaviour:
