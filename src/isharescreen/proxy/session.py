@@ -22,6 +22,7 @@ calls `connect()` again.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -434,9 +435,10 @@ class Session:
         # Drain queues — see _video_drain_loop / _ctrl_drain_loop. The
         # drain threads do nothing but recvfrom + put_nowait; the
         # process threads do all decrypt + dispatch work.
-        self._video_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
+        self._video_q: queue.Queue[tuple[float, bytes]] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._ctrl_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._video_q_dropped = 0
+        self._video_queue_age_ms = 0.0
         self._ctrl_q_dropped = 0
         # RX/TX byte+packet counters. _rx_msg_type_counts[type] tracks
         # inbound RFB msg-type histogram on the TCP control channel —
@@ -1279,6 +1281,11 @@ class Session:
             server_height=self._negotiation.canvas_height,
             alt_session=cfg.alt_session,
         )
+        self._input.set_reference_dims(*self.server_dims)
+        self._perf_timing = (
+            self._input.note_timing if self._input.performance_enabled else None)
+        if self._perf_timing is not None and hasattr(self._decoder, "set_timing_callback"):
+            self._decoder.set_timing_callback(self._perf_timing)
 
         # 9b) Inbound clipboard sync (host → local OS). Enable the daemon's
         # change-notification subscription (msg 0x15) and prime the local
@@ -1491,6 +1498,18 @@ class Session:
         so do NOT block here -- if a future command needs heavy work,
         offload it. Best effort: unknown actions are logged and ignored."""
         action = cmd.get("action")
+        if action == "input_status":
+            if self._control is not None and self._input is not None:
+                self._control.publish_snapshot({
+                    "input": self._input.diagnostics(),
+                    "canvas": list(self.canvas_dims),
+                    "scaled": list(self.scaled_dims),
+                    "displays": [
+                        {"x": r.x, "y": r.y, "w": r.w, "h": r.h}
+                        for r in self.display_rects
+                    ],
+                })
+            return
         if action == "fir":
             # Force an IDR refresh on every tile. Same effect as the
             # TUI's force-IDR ('f') action.
@@ -1502,6 +1521,15 @@ class Session:
         if action == "set":
             key = cmd.get("key")
             value = cmd.get("value")
+            if key in ("pointer_protocol", "pointer_space"):
+                try:
+                    self._input.set_pointer_policy(**{
+                        "protocol" if key == "pointer_protocol" else "space": value,
+                    })
+                    log.info("ctrl: %s=%s", key, value)
+                except (ValueError, AttributeError):
+                    log.warning("ctrl: rejected pointer policy")
+                return
             # Audio toggle: unhook (or rehook) the sink callback. The
             # network audio still arrives; we just stop feeding it to
             # PortAudio. Cheap, reversible.
@@ -2328,7 +2356,7 @@ class Session:
                         loss_count += 1
                         continue
             try:
-                q.put_nowait(pkt)
+                q.put_nowait((time.monotonic(), pkt))
             except queue.Full:
                 self._video_q_dropped += 1
 
@@ -2337,14 +2365,22 @@ class Session:
         if decryptor is None:
             return
         q = self._video_q
+        sampled_packets = 0
         while not self._stop_evt.is_set():
             try:
-                pkt = q.get(timeout=_UDP_RECV_TIMEOUT_S)
+                received_at, pkt = q.get(timeout=_UDP_RECV_TIMEOUT_S)
             except queue.Empty:
                 self._evict_stale_groups()
                 continue
 
+            # Sparse timing only; do not add a per-packet lock on the hot path.
+            perf_timing = getattr(self, "_perf_timing", None)
+            sample_decrypt = perf_timing is not None and sampled_packets % 64 == 0
+            sampled_packets += 1
+            decrypt_started = time.monotonic() if sample_decrypt else 0.0
             res = decryptor.decrypt(pkt)
+            if sample_decrypt:
+                perf_timing("video_decrypt", (time.monotonic() - decrypt_started) * 1000)
             if res is None:
                 continue
             hdr, payload = res
@@ -2355,6 +2391,9 @@ class Session:
 
             self._track_seq(ssrc, seq)
             self._note_unknown_ssrc(ssrc)
+            self._video_queue_age_ms = (time.monotonic() - received_at) * 1000
+            if perf_timing is not None:
+                perf_timing("video_wait", self._video_queue_age_ms)
             self._queue_video_group_packet(ssrc, ts, seq, marker, payload)
 
             # Expire repair/no-marker holes even while the queue stays busy.
@@ -2364,6 +2403,7 @@ class Session:
             if now - self._last_group_evict_t >= 0.020:
                 self._last_group_evict_t = now
                 self._evict_stale_groups()
+
 
     @staticmethod
     def _sorted_group_packets(grp: list[_PktTuple]) -> list[_PktTuple]:
@@ -2584,7 +2624,11 @@ class Session:
         _reassemble = reassemble_h264 if self._video_codec == "avc" else reassemble_group
         au_cb = self._video_au_callback if self._video_codec == "avc" else None
 
+        perf_timing = getattr(self, "_perf_timing", None)
+        reassemble_started = time.monotonic() if perf_timing is not None else 0.0
         nalus = list(_reassemble(ordered))
+        if perf_timing is not None:
+            perf_timing("video_reassemble", (time.monotonic() - reassemble_started) * 1000)
 
         # If a dynamic resolution change is in progress, harvest fresh
         # VPS/SPS/PPS from the new encoder's burst so the restarted
@@ -3783,7 +3827,8 @@ class Session:
             "udp_q": {
                 "video": {"depth": self._video_q.qsize(),
                           "cap": _UDP_DRAIN_QUEUE_MAX,
-                          "drop": self._video_q_dropped},
+                          "drop": self._video_q_dropped,
+                              "age_ms": round(self._video_queue_age_ms, 1)},
                 "ctrl":  {"depth": self._ctrl_q.qsize(),
                           "cap": _UDP_DRAIN_QUEUE_MAX,
                           "drop": self._ctrl_q_dropped},
@@ -3952,6 +3997,20 @@ class Session:
             nalu_str,
         )
 
+        perf_input = getattr(self, "_input", None)
+        perf_snapshot = (perf_input.performance_snapshot()
+                         if getattr(perf_input, "performance_enabled", False) else None)
+        if perf_snapshot is not None:
+            now = time.monotonic()
+            if now - getattr(self, "_last_perf_log_t", 0.0) >= 5.0:
+                self._last_perf_log_t = now
+                log.info(
+                    "pi-perf: canvas=%dx%d decoder=%s udp_depth=%d packet_age_ms=%.1f stats=%s",
+                    *self.canvas_dims, decoder_name, self._video_q.qsize(),
+                    self._video_queue_age_ms,
+                    json.dumps(perf_snapshot, separators=(",", ":")),
+                )
+
         # Mirror the same data, structured, onto the control socket for
         # any subscribed TUI / monitor clients. The shape is documented in
         # control.py.
@@ -3973,7 +4032,8 @@ class Session:
                 "udp_q": {
                     "video": {"depth": self._video_q.qsize(),
                               "cap": _UDP_DRAIN_QUEUE_MAX,
-                              "drop": self._video_q_dropped},
+                              "drop": self._video_q_dropped,
+                              "age_ms": round(self._video_queue_age_ms, 1)},
                     "ctrl":  {"depth": self._ctrl_q.qsize(),
                               "cap": _UDP_DRAIN_QUEUE_MAX,
                               "drop": self._ctrl_q_dropped},
@@ -4001,6 +4061,7 @@ class Session:
                     "cap": getattr(self._decoder, "decode_queue_cap", 512),
                     "drop": getattr(self._decoder, "decode_queue_drops", 0),
                 } if self._decoder is not None else None,
+                **({"stage_timings_ms": perf_snapshot} if perf_snapshot is not None else {}),
             })
 
     def _send_heartbeat(self) -> None:

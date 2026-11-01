@@ -293,17 +293,15 @@ def run(
     _pending_cursor: dict[str, "Optional[object]"] = {"img": _NO_PENDING}
     _cursor_lock = threading.Lock()
 
-    # GLFW set_cursor thread-safety:
-    #   macOS: Cocoa requires NSCursor calls on main thread
-    #   Linux X11 / Windows: GLFW handles cross-thread set_cursor
-    # On Linux/Windows we apply directly from the proxy thread so we
-    # don't lose intermediate cursor frames between video-frame-paced
-    # render iterations. On macOS we defer to the render loop.
+    # GLFW cursor APIs belong on the main event-loop thread. Defer the
+    # network callback on every platform, including Linux/Wayland.
     # `_set_cursor_now` is defined later (after the GLFW window setup);
     # Python closure resolution happens at call time, by which point
     # the callback will only fire post-connect when everything's set up.
     import sys as _sys
-    _cursor_direct_apply = _sys.platform in ("linux", "win32")
+    # GLFW cursor APIs require the main thread. In particular, do not
+    # call the Wayland backend from the network/clipboard worker thread.
+    _cursor_direct_apply = False
 
     # Cursor: by default we hide the local OS cursor and render the host's
     # separately-sent cursor (enc 1104) ourselves as a wgpu overlay — the way
@@ -359,6 +357,11 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
+    # Window hints adapted from upstream PR #28 by @sjwasko.
+    # https://github.com/renegadelink/iShareScreen/pull/28
+    for hint in ("WAYLAND_APP_ID", "X11_CLASS_NAME", "X11_INSTANCE_NAME"):
+        if hasattr(glfw, hint):
+            glfw.window_hint_string(getattr(glfw, hint), "isharescreen")
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
@@ -393,6 +396,8 @@ def run(
     # the `_os_cursor_hidden` block below), so the OS cursor stays as a
     # fallback until the host cursor is ready to take over.
     _os_cursor_hidden = {"v": False}
+    if not _canvas_cursor:
+        glfw.set_input_mode(glfw_window, glfw.CURSOR, glfw.CURSOR_NORMAL)
     # Window resizes freely. When the host fell back to a frame smaller
     # than the advertised canvas, the renderer (see gpu.Renderer.draw)
     # centers that real frame in the window at its native on-screen size
@@ -429,7 +434,8 @@ def run(
         device=device, format=surface_format, alpha_mode="opaque",
     )
 
-    renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+    renderer = Renderer(device, surface_format, canvas_w, canvas_h,
+                        timing_callback=session.input.note_timing)
 
     def _cursor_user_mult() -> float:
         """Manual ISS_CURSOR_SCALE multiplier (default 1.0)."""
@@ -573,7 +579,11 @@ def run(
             session.input.pointer_event(button_mask, cursor[0], cursor[1])
 
     def on_mouse_button(_w, button, action, _mods):
-        nonlocal button_mask
+        nonlocal button_mask, cursor
+        # A first click or a click after a layout transition may arrive without
+        # any cursor-motion callback. Re-map the current position at click time.
+        if not _mw_views:
+            cursor = to_canvas(*glfw.get_cursor_pos(glfw_window))
         bit = glfw_button_to_rfb_bit(button)
         if bit == 0:
             return
@@ -712,12 +722,14 @@ def run(
             kbd_grab.enable()
 
         def on_window_focus(_w, focused):
+            session.input.set_focus(bool(focused))
             if focused:
                 kbd_grab.enable()
             else:
                 kbd_grab.disable()
 
         glfw.set_window_focus_callback(glfw_window, on_window_focus)
+        session.input.set_focus(bool(glfw.get_window_attrib(glfw_window, glfw.FOCUSED)))
     else:
         kbd_grab = None
 
@@ -887,10 +899,14 @@ def run(
     _locked_aspect: list = [0.0]  # last content aspect the window was locked to
     _geom_last: list = [()]  # last logged render-geom tuple (re-log only on change)
     _crop_applied: list = [display < 0]  # --display crop latched once layout lands
+    _callback_ms = [0.0]
 
     def draw_callback():
+        callback_started = time.monotonic()
         try:
+            acquire_started = time.monotonic()
             target = surface_ctx.get_current_texture()
+            session.input.note_timing("surface_acquire", (time.monotonic() - acquire_started) * 1000)
             # Multi-window: re-assert THIS window's crop before drawing. The
             # shared renderer's source-rect is left at the last secondary's crop
             # after each loop iteration, so a repaint the loop didn't trigger
@@ -1003,6 +1019,10 @@ def run(
                     _device_lost["v"] = True
                 return
             raise
+        finally:
+            elapsed = (time.monotonic() - callback_started) * 1000
+            _callback_ms[0] += elapsed
+            session.input.note_timing("render_callback", elapsed)
 
     window.request_draw(draw_callback)
 
@@ -1110,13 +1130,12 @@ def run(
     _glfw_cursor_handle_cache: dict[int, "tuple[object, object, object]"] = {}
 
     def _set_cursor_now(img):
-        """Apply a cursor immediately — direct path used on platforms
-        where GLFW is thread-safe enough for set_cursor off the main
-        thread (Windows + Linux/X11). Avoids the per-frame delay of
-        the render-loop deferral, which was losing intermediate
-        cursor frames when shape changed faster than video FPS.
-
-        `img is None` reverts to the local OS default cursor."""
+        """Apply the pending shape on the main thread; None restores the arrow."""
+        # An empty/transparent shape must not replace the Pi's visible
+        # system pointer with an invisible cursor during login transitions.
+        if img is not None and (
+                img.width <= 0 or img.height <= 0 or not any(img.rgba[3::4])):
+            img = None
         if img is _cursor_state["img"]:
             return
         try:
@@ -1154,8 +1173,8 @@ def run(
         """Pull a pending cursor shape from the slot on the render thread and
         apply it. In canvas-cursor mode this uploads the overlay texture
         (which must happen on the device-owning thread); in legacy mode it
-        sets the local OS cursor. On Linux/Windows the legacy path also
-        applies directly from the proxy thread, so the slot is usually empty.
+        sets the local OS cursor. All GLFW cursor updates stay on this
+        thread, including on Linux/Wayland and Windows.
 
         `_pending_cursor["img"]` may legitimately be None (revert to OS
         default) — distinguished from "no pending update" by a sentinel."""
@@ -1202,7 +1221,8 @@ def run(
         slot_h = canvas_h // num_tiles if num_tiles else canvas_h
         slot_h_resolved = False
         first_seen = [False] * num_tiles
-        renderer = Renderer(device, surface_format, canvas_w, canvas_h)
+        renderer = Renderer(device, surface_format, canvas_w, canvas_h,
+                            timing_callback=session.input.note_timing)
         # In the default single-monitor/auto mode, a layout gap may first
         # appear on a later dynamic resize rather than in the initial layout.
         # Arm the corrective crop then too. `_mw_views` is non-empty once a
@@ -1288,6 +1308,7 @@ def run(
                 return
 
     while time.monotonic() < deadline:
+        session.input.note_event_pump()
         glfw.poll_events()
         _apply_pending_cursor()
         # Hide the local OS cursor only once the overlay can actually draw —
@@ -1389,7 +1410,9 @@ def run(
         # Drain fresh decoded frames + upload.
         any_fresh = False
         for ti in range(num_tiles):
+            _frame_started = time.monotonic()
             tf = session.get_frame(ti)
+            session.input.note_timing("get_frame", (time.monotonic() - _frame_started) * 1000)
             if tf is None:
                 continue
             first_seen[ti] = True
@@ -1399,7 +1422,9 @@ def run(
             if not slot_h_resolved:
                 slot_h = tf.height
                 slot_h_resolved = True
+            _upload_started = time.monotonic()
             renderer.upload_tile(ti, tf, slot_h)
+            session.input.note_timing("upload", (time.monotonic() - _upload_started) * 1000)
             any_fresh = True
 
         # Present after a fresh upload, OR when the overlay cursor moved or
@@ -1411,6 +1436,8 @@ def run(
             sv.cursor != sv.last_drawn for sv in secondaries)
         if ((any_fresh or cursor_moved or _sec_moved or _cursor_dirty["v"])
                 and any(first_seen)):
+            _draw_started = time.monotonic()
+            _callback_ms[0] = 0.0
             if display_all:
                 # Draw each window with its own crop. Every draw callback
                 # (primary draw_callback and each secondary draw2) self-asserts
@@ -1424,6 +1451,10 @@ def run(
                 window.force_draw()
             _last_drawn_cursor = cursor
             _cursor_dirty["v"] = False
+            _draw_ms = (time.monotonic() - _draw_started) * 1000
+            session.input.note_timing("draw", _draw_ms)
+            # Includes rendercanvas bookkeeping and present, not pure GPU time.
+            session.input.note_timing("present_other", max(0.0, _draw_ms - _callback_ms[0]))
 
     log.info("desktop frontend closing")
     for sv in secondaries:
