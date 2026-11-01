@@ -206,6 +206,7 @@ class AvcDecoder:
         self._prefer_hwaccel = prefer_hwaccel
         self._on_frame_published = on_frame_published
         self._on_timing = None
+        self._borrow_planes = os.environ.get("ISS_PI_FRAME_VIEWS") == "1"
         self._tiles = [_TileSlot() for _ in range(num_tiles)]
         # ONE shared context: the 4 tiles are decoded as a single timestamp-
         # ordered stream (verified — feeding all tiles' NALs to one context in
@@ -571,6 +572,7 @@ class AvcDecoder:
         convert_started = time.monotonic() if self._on_timing is not None else 0.0
         tile_frame, had_error = _av_frame_to_tile(
             frame, self._reformatter, self._seen_fmts,
+            borrow_planes=self._borrow_planes,
         )
         if self._on_timing is not None:
             self._on_timing("convert", (time.monotonic() - convert_started) * 1000)

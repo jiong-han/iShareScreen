@@ -73,6 +73,7 @@ Issues = "https://github.com/renegadelink/iShareScreen/issues"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["gpu: requires a working native wgpu adapter (V3D, Metal, or equivalent)"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/isharescreen"]

@@ -127,6 +127,7 @@ def _av_frame_to_tile(
     frame: av.VideoFrame,
     reformatter_holder: list[Optional[av.video.reformatter.VideoReformatter]],
     seen_fmts: set[str],
+    *, borrow_planes: bool = False,
 ) -> tuple[Optional[TileFrame], bool]:
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
@@ -187,6 +188,16 @@ def _av_frame_to_tile(
 
     if fmt in ("yuv420p", "yuvj420p"):
         yp, up, vp = frame.planes
+        if borrow_planes:
+            # Pi desktop opt-in: skip three full-plane bytes allocations.
+            # Keep the frame alive, expose read-only buffers, preserve stride.
+            return TileFrame(
+                y=memoryview(yp).toreadonly(), u=memoryview(up).toreadonly(),
+                v=memoryview(vp).toreadonly(), owner=frame,
+                width=width, height=height, y_stride=yp.line_size,
+                uv_stride=up.line_size, chroma_width=width // 2,
+                chroma_height=height // 2,
+            ), had_error
         return TileFrame(
             y=bytes(yp), u=bytes(up), v=bytes(vp),
             width=width, height=height,

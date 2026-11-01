@@ -206,6 +206,7 @@ class Renderer:
     ) -> None:
         self._device = device
         self._on_timing = timing_callback
+        self._last_uniforms = None
         self._w = canvas_w
         self._h = canvas_h
 
@@ -492,16 +493,10 @@ class Renderer:
         # Diagnostics: how this tile actually landed in the texture.
         self._dbg_tiles[tile_index] = (w, tile.height, slot_height, origin_y, rows)
 
-        y = np.frombuffer(tile.y, dtype=np.uint8)
-        if tile.y_stride == w:
-            y = y[: w * tile.height].reshape(tile.height, w)
-        else:
-            y = y[: tile.y_stride * tile.height].reshape(
-                tile.height, tile.y_stride)[:, :w]
         self._device.queue.write_texture(
             {"texture": self._y_tex, "origin": origin},
-            np.ascontiguousarray(y[:rows]),
-            {"offset": 0, "bytes_per_row": w},
+            tile.y,
+            {"offset": 0, "bytes_per_row": tile.y_stride},
             (w, rows, 1),
         )
 
@@ -517,34 +512,24 @@ class Renderer:
             # straight into the rg8unorm texture — no CPU deinterleave. The
             # source row pitch is `uv_stride` bytes (≥ 2*cw); write_texture
             # consumes 2*cw bytes/row (rg8) and skips the padding tail.
-            uv = np.frombuffer(tile.u, dtype=np.uint8)
-            uv = uv[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)
             self._device.queue.write_texture(
                 {"texture": self._uv_tex, "origin": origin},
-                np.ascontiguousarray(uv[:chroma_rows]),
+                tile.u,
                 {"offset": 0, "bytes_per_row": tile.uv_stride},
                 (cw, chroma_rows, 1),
             )
             return
 
-        u = np.frombuffer(tile.u, dtype=np.uint8)
-        v = np.frombuffer(tile.v, dtype=np.uint8)
-        if tile.uv_stride == cw:
-            u = u[: cw * ch].reshape(ch, cw)
-            v = v[: cw * ch].reshape(ch, cw)
-        else:
-            u = u[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
-            v = v[: tile.uv_stride * ch].reshape(ch, tile.uv_stride)[:, :cw]
         self._device.queue.write_texture(
             {"texture": self._u_tex, "origin": origin},
-            np.ascontiguousarray(u[:chroma_rows]),
-            {"offset": 0, "bytes_per_row": cw},
+            tile.u,
+            {"offset": 0, "bytes_per_row": tile.uv_stride},
             (cw, chroma_rows, 1),
         )
         self._device.queue.write_texture(
             {"texture": self._v_tex, "origin": origin},
-            np.ascontiguousarray(v[:chroma_rows]),
-            {"offset": 0, "bytes_per_row": cw},
+            tile.v,
+            {"offset": 0, "bytes_per_row": tile.uv_stride},
             (cw, chroma_rows, 1),
         )
 
@@ -683,11 +668,11 @@ class Renderer:
         # both the span and the offset by the ratio lands sampling on the same
         # region of content — the bilinear sampler upsamples to luma res.
         crx, cry = self._chroma_ratio
-        self._device.queue.write_buffer(
-            self._uniform_buf, 0,
-            np.array([ux, uy, ox, oy, ux * crx, uy * cry, ox * crx, oy * cry],
-                     dtype=np.float32).tobytes(),
-        )
+        uniforms = (ux, uy, ox, oy, ux * crx, uy * cry, ox * crx, oy * cry)
+        if uniforms != self._last_uniforms:
+            self._device.queue.write_buffer(
+                self._uniform_buf, 0, np.array(uniforms, dtype=np.float32).tobytes())
+            self._last_uniforms = uniforms
         # Fill the whole window (the pre-rework baseline behavior). The window
         # is aspect-locked to the content (see app.py), so a free resize fills
         # with no distortion; when the window can't hold the aspect (maximize

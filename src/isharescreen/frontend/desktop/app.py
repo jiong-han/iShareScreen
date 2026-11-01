@@ -25,6 +25,7 @@ from .audio_sink import make_audio_sink
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
 from .resolution_shortcuts import ResolutionShortcuts
+from .pi_presentation import prefer_mailbox
 
 
 # X11 keysyms for the Cmd-equivalent (Super_L / Super_R). When Ctrl→Cmd
@@ -438,6 +439,9 @@ def run(
     surface_format = (
         preferred[: -len("-srgb")] if preferred.endswith("-srgb") else preferred
     )
+    if os.environ.get("ISS_PI_MAILBOX") == "1":
+        mode, reason = prefer_mailbox(surface_ctx, adapter)
+        log.info("Pi presentation: %s (%s)", mode, reason)
     surface_ctx.configure(
         device=device, format=surface_format, alpha_mode="opaque",
     )
@@ -1472,6 +1476,14 @@ def run(
             if num_tiles == 1:
                 fresh_video_dims = (tf.width, tf.height)
             any_fresh = True
+
+        if any_fresh:
+            # Forward input that arrived during upload before entering a
+            # potentially blocking present. GLFW remains on the UI thread.
+            session.input.note_event_pump()
+            glfw.poll_events()
+            if window.get_closed() or glfw.window_should_close(glfw_window):
+                break
 
         # Present after a fresh upload, OR when the overlay cursor moved or
         # changed shape — otherwise a pointer that moves/reshapes over a
