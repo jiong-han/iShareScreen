@@ -21,6 +21,7 @@ as unwritten black padding, which `uv_scale` also crops out of sampling).
 from __future__ import annotations
 
 import logging
+import time
 import os
 
 import numpy as np
@@ -201,8 +202,10 @@ class Renderer:
     def __init__(
         self, device: wgpu.GPUDevice, surface_format: wgpu.TextureFormat,
         canvas_w: int, canvas_h: int,
+        *, timing_callback=None,
     ) -> None:
         self._device = device
+        self._on_timing = timing_callback
         self._w = canvas_w
         self._h = canvas_h
 
@@ -663,6 +666,7 @@ class Renderer:
         smaller than the advertised canvas) is never sampled."""
         # The presented sub-rect (crop) in canvas texels: the full decoded
         # content by default, or one host monitor when a display crop is set.
+        encode_started = time.monotonic() if self._on_timing is not None else 0.0
         rx, ry, cw, ch = self.source_rect()
         # uv_scale maps the viewport's [0,1] onto the crop's width/height in the
         # texture; uv_offset shifts sampling to the crop's origin. Together they
@@ -757,7 +761,13 @@ class Renderer:
             rpass.draw(4)
 
         rpass.end()
-        self._device.queue.submit([encoder.finish()])
+        command = encoder.finish()
+        if self._on_timing is not None:
+            self._on_timing("gpu_encode", (time.monotonic() - encode_started) * 1000)
+        submit_started = time.monotonic() if self._on_timing is not None else 0.0
+        self._device.queue.submit([command])
+        if self._on_timing is not None:
+            self._on_timing("gpu_submit", (time.monotonic() - submit_started) * 1000)
 
 
 __all__ = ["Renderer", "WGSL"]

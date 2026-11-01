@@ -18,9 +18,13 @@ responsiveness. Keyboard input still uses msg 0x04 KeyEvent.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import socket
 import struct
 import threading
+import time
+from collections import deque
 from typing import Optional
 
 from Crypto.Cipher import AES
@@ -101,6 +105,21 @@ class InputController:
         self._w = server_width
         self._h = server_height
         self._alt_session = alt_session
+        self._reference_dims = (server_width, server_height)
+        self._pointer_protocol = "encrypted"
+        self._pointer_space = "canvas"
+        self._key_events = 0
+        self._pointer_events = 0
+        self._focused = None
+        self._last_pointer = None
+        self._timings = {}
+        self._performance_enabled = os.environ.get("ISS_PI_PERF_STATS") == "1"
+        self._timing_windows = {}
+        self._timing_windows_lock = threading.Lock()
+        self._last_pump = None
+        self._last_buttons = 0
+        self._last_button_down_ms = None
+        self._last_key_down_ms = None
         self._lock = threading.Lock()
         self._closed = False
         # Cumulative TX packet counter; Session reads it for the
@@ -121,12 +140,126 @@ class InputController:
             self._w = w
             self._h = h
 
+    def set_reference_dims(self, w: int, h: int) -> None:
+        """Keep ServerInit geometry separate from the changing video canvas."""
+        if w > 0 and h > 0:
+            self._reference_dims = (w, h)
+
+    def set_pointer_policy(self, *, protocol=None, space=None) -> None:
+        """Local diagnostics controls; preserve the normal policy by default.
+
+        Both pointer protocols still pass through the encrypted record layer.
+        No key values or clipboard contents are included in diagnostics.
+        """
+        if protocol is not None:
+            if protocol not in ("encrypted", "rfb"):
+                raise ValueError("unsupported pointer protocol")
+            self._pointer_protocol = protocol
+        if space is not None:
+            if space not in ("canvas", "server"):
+                raise ValueError("unsupported pointer coordinate space")
+            self._pointer_space = space
+
+    def set_focus(self, focused: bool) -> None:
+        self._focused = bool(focused)
+
+    def note_timing(self, name: str, milliseconds: float) -> None:
+        legacy = name in ("send", "event_gap", "get_frame", "draw")
+        if not legacy and not (self._performance_enabled and name in (
+                "decode", "convert", "upload", "video_wait", "decoded_wait",
+                "surface_acquire", "render_callback", "present_other",
+                "gpu_encode", "gpu_submit", "video_decrypt", "avc_header",
+                "avc_feed", "video_reassemble")):
+            return
+        if not math.isfinite(milliseconds) or milliseconds < 0:
+            return
+        if legacy:
+            previous = self._timings.get(name, (0, 0.0, 0.0, 0.0))
+            self._timings[name] = (
+                previous[0] + 1, previous[1] + milliseconds,
+                max(previous[2], milliseconds), milliseconds,
+            )
+        if self._performance_enabled:
+            now = time.monotonic()
+            with self._timing_windows_lock:
+                samples = self._timing_windows.get(name)
+                if samples is None:
+                    samples = self._timing_windows[name] = deque(maxlen=2048)
+                # UDP packet bursts can be huge; sample this stage at <=100Hz.
+                if name == "video_wait" and samples and now - samples[-1][0] < 0.01:
+                    return
+                samples.append((now, milliseconds))
+                while samples and samples[0][0] < now - 10.0:
+                    samples.popleft()
+
+    @property
+    def performance_enabled(self) -> bool:
+        return self._performance_enabled
+
+    def performance_snapshot(self) -> dict | None:
+        if not self._performance_enabled:
+            return None
+        cutoff = time.monotonic() - 10.0
+        with self._timing_windows_lock:
+            windows = {name: [v for ts, v in samples if ts >= cutoff]
+                       for name, samples in self._timing_windows.items()}
+        stages = {}
+        for name, values in windows.items():
+            if not values:
+                continue
+            values.sort()
+            def percentile(q):
+                return round(values[max(0, math.ceil(len(values) * q) - 1)], 3)
+            stages[name] = {
+                "count": len(values), "mean": round(sum(values) / len(values), 3),
+                "p50": percentile(0.5), "p95": percentile(0.95),
+                "p99": percentile(0.99), "max": round(values[-1], 3),
+            }
+        return {"window_s": 10, "sample_cap": 2048, "stages_ms": stages}
+
+    def note_event_pump(self) -> None:
+        now = time.monotonic()
+        if self._last_pump is not None:
+            self.note_timing("event_gap", (now - self._last_pump) * 1000)
+        self._last_pump = now
+
+    def diagnostics(self) -> dict:
+        result = {
+            "focused": self._focused,
+            "pointer_protocol": self._pointer_protocol,
+            "pointer_space": self._pointer_space,
+            "canvas": [self._w, self._h],
+            "server_init": list(self._reference_dims),
+            "key_event_count": self._key_events,
+            "pointer_event_count": self._pointer_events,
+            "last_pointer": self._last_pointer,
+            "last_button_down_ms": self._last_button_down_ms,
+            "last_key_down_ms": self._last_key_down_ms,
+            "timings_ms": {
+                k: {"count": v[0], "mean": round(v[1] / v[0], 3),
+                    "max": round(v[2], 3), "last": round(v[3], 3)}
+                for k, v in tuple(self._timings.items())
+            },
+        }
+        if self._performance_enabled:
+            result["timing_windows_ms"] = self.performance_snapshot()
+        return result
+
     # ── public event API ──────────────────────────────────────────────
 
     def pointer_event(self, buttons: int, x: int, y: int) -> None:
+        if buttons & ~self._last_buttons:
+            self._last_button_down_ms = time.time_ns() / 1_000_000
+        self._last_buttons = buttons
         cx = max(0, min(self._w - 1, int(x)))
         cy = max(0, min(self._h - 1, int(y)))
-        if self._cipher is not None:
+        if self._pointer_space == "server":
+            rw, rh = self._reference_dims
+            cx = round(cx * (rw - 1) / max(1, self._w - 1))
+            cy = round(cy * (rh - 1) / max(1, self._h - 1))
+        self._pointer_events += 1
+        self._last_pointer = [cx, cy]
+        if self._cipher is not None and self._pointer_protocol == "encrypted":
             # Apple's stock HP client (both cmd=1 console-share and
             # cmd=2 alt-user) wraps every pointer event in msg 0x10
             # HandleEncryptedEventMessage rather than the standard
@@ -161,6 +294,9 @@ class InputController:
     def key_event(self, down: bool, keysym: int) -> None:
         if not keysym:
             return
+        if down:
+            self._last_key_down_ms = time.time_ns() / 1_000_000
+        self._key_events += 1
         self._send(build_key_event(down=bool(down), keysym=int(keysym)))
 
     def request_framebuffer_update(
@@ -211,6 +347,7 @@ class InputController:
     # ── internals ─────────────────────────────────────────────────────
 
     def _send(self, payload: bytes) -> None:
+        started = time.monotonic()
         with self._lock:
             if self._closed:
                 return
@@ -232,3 +369,5 @@ class InputController:
                 self.tx_pkts += 1
             except OSError as e:
                 log.debug("input send dropped: %s", e)
+            finally:
+                self.note_timing("send", (time.monotonic() - started) * 1000)

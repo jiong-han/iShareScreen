@@ -205,6 +205,7 @@ class AvcDecoder:
             prefer_hwaccel = False
         self._prefer_hwaccel = prefer_hwaccel
         self._on_frame_published = on_frame_published
+        self._on_timing = None
         self._tiles = [_TileSlot() for _ in range(num_tiles)]
         # ONE shared context: the 4 tiles are decoded as a single timestamp-
         # ordered stream (verified — feeding all tiles' NALs to one context in
@@ -282,6 +283,10 @@ class AvcDecoder:
 
     # -- setup ---------------------------------------------------------
 
+    def set_timing_callback(self, callback) -> None:
+        """Attach optional numeric stage telemetry after input initialization."""
+        self._on_timing = callback
+
     def set_params(self, vps: bytes, sps: bytes, all_pps: dict) -> None:
         """Install SPS/PPS. `vps` is ignored (H.264 has none); all_pps is the
         {pps_id: pps_nal} map harvested from an avcC config. Tiles share the
@@ -356,6 +361,15 @@ class AvcDecoder:
                 self.feed_nalu(nalu, ti)
 
     def feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
+        if self._on_timing is None:
+            return self._feed_nalu(nalu, tile_idx, donl)
+        started = time.monotonic()
+        try:
+            return self._feed_nalu(nalu, tile_idx, donl)
+        finally:
+            self._on_timing("avc_feed", (time.monotonic() - started) * 1000)
+
+    def _feed_nalu(self, nalu: bytes, tile_idx: int, donl: Optional[int] = None) -> None:
         if not nalu or not (0 <= tile_idx < self.num_tiles):
             return
         t = h264_nal_type(nalu[0])
@@ -369,7 +383,10 @@ class AvcDecoder:
             # changes (see Session._maybe_reharvest_avc_config).
             return
         nb = nalu if isinstance(nalu, bytes) else bytes(nalu)
+        header_started = time.monotonic() if self._on_timing is not None else 0.0
         is_key = _nal_is_keyframe(nb)
+        if self._on_timing is not None:
+            self._on_timing("avc_header", (time.monotonic() - header_started) * 1000)
         # Post-restart / broken-reference keyframe gate. After a restart the
         # DPB is empty; after a confirmed reference miss it is poisoned. In
         # either case, feeding inter slices before a fresh intra picture merely
@@ -481,6 +498,8 @@ class AvcDecoder:
                     self._decode_latency_ms = (
                         0.1 * latency_ms + 0.9 * self._decode_latency_ms
                     )
+                    if self._on_timing is not None:
+                        self._on_timing("decode", latency_ms)
                 if not self._dpb_ready:
                     self._dpb_ready = True
                     for _t in range(self.num_tiles):
@@ -489,6 +508,7 @@ class AvcDecoder:
                 with slot.lock:
                     slot.raw_frame = frame
                     slot.good_count += 1
+                    slot.published_at = _time.monotonic()
                 published.append(ti)
         # Notify outside the codec lock to avoid holding it across the callback.
         if self._on_frame_published is not None:
@@ -542,12 +562,18 @@ class AvcDecoder:
         with slot.lock:
             frame = slot.raw_frame
             count = slot.good_count
+            published_at = slot.published_at
             already = count <= slot.last_evaluated_count
         if frame is None or already:
             return None
+        if self._on_timing is not None and published_at:
+            self._on_timing("decoded_wait", (time.monotonic() - published_at) * 1000)
+        convert_started = time.monotonic() if self._on_timing is not None else 0.0
         tile_frame, had_error = _av_frame_to_tile(
             frame, self._reformatter, self._seen_fmts,
         )
+        if self._on_timing is not None:
+            self._on_timing("convert", (time.monotonic() - convert_started) * 1000)
         with slot.lock:
             slot.last_evaluated_count = count
         if tile_frame is None:

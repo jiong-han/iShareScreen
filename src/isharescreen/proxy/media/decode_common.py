@@ -87,6 +87,7 @@ class _TileSlot:
     don't tear."""
     raw_frame: Optional[av.VideoFrame] = None
     good_count: int = 0
+    published_at: float = 0.0
     # Frames published WITHOUT a libav decode-error flag — i.e. actually
     # clean video, not concealed gray. `good_count` counts every published
     # frame including concealed ones, so a fully-gray tile still shows a
