@@ -19,3 +19,7 @@ tools/*
 
 # Local agent / editor session scratch
 .claude/
+
+# Machine-local Pi profile and generated shortcuts
+pi.ini
+isharescreen-pi.desktop

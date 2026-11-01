@@ -1,0 +1,6 @@
+# Video/window versions used by the Pi V4 path. This constrains these packages;
+# it is not a complete dependency lock or a platform-independent guarantee.
+av==19.0.2
+wgpu==0.32.0
+rendercanvas==2.7.2
+glfw==2.11.0

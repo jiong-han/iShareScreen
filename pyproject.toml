@@ -58,12 +58,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Local test suite — fast, deterministic unit tests that need no remote host,
-# no real decode and no network. `pip install -e .[test]` then `pytest`.
+# Local tests need no remote host. Synthetic software-decode and optional
+# native GPU pixel checks are included; use -m "not gpu" on CPU-only runners.
 test = ["pytest>=8"]
 
 [project.scripts]
 iss = "isharescreen.tui.entry:main"
+iss-pi = "isharescreen.pi:main"
 isharescreen = "isharescreen.tui.entry:main"
 
 [project.urls]
