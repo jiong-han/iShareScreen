@@ -175,7 +175,10 @@ def _nal_is_keyframe(nalu: bytes) -> bool:
     if t == 1:               # NAL_SLICE_NONIDR — intra if slice_type is I
         from .bitstream import BitReader, remove_emulation_prevention
         try:
-            br = BitReader(remove_emulation_prevention(nalu[1:]))
+            # Only two bounded ue(v) fields are needed. Each read_ue consumes
+            # at most 65 bits, so 64 EBSP bytes (>42 RBSP bytes even with
+            # maximal escaping) cover both. Never scan the coded picture.
+            br = BitReader(remove_emulation_prevention(nalu[1:65]))
             br.read_ue()                  # first_mb_in_slice
             return br.read_ue() in (2, 7)  # slice_type
         except Exception:

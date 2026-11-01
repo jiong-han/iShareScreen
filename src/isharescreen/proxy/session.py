@@ -314,6 +314,26 @@ class SessionConfig:
 _PktTuple = tuple[int, bool, bytes]  # (seq, marker, payload)
 
 
+class _VideoPacketGroup(list):
+    """List-compatible AU with constant-time retransmit/marker bookkeeping.
+
+    State lives with the list so all existing pop/clear/resize paths release
+    it together. Burst-provided plain lists retain the legacy fallback.
+    """
+    __slots__ = ("sequences", "has_marker")
+
+    def __init__(self):
+        super().__init__()
+        self.sequences = set()
+        self.has_marker = False
+
+    def add_packet(self, seq: int, marker: bool, payload: bytes) -> None:
+        if seq not in self.sequences:
+            self.sequences.add(seq)
+            super().append((seq, marker, payload))
+            self.has_marker = self.has_marker or marker
+
+
 # ── Session ──────────────────────────────────────────────────────────
 
 class Session:
@@ -2435,15 +2455,20 @@ class Session:
             return
         grp = self._pending_groups.get(key)
         if grp is None:
-            grp = []
+            grp = _VideoPacketGroup()
             self._pending_groups[key] = grp
             self._group_arrival[key] = time.monotonic()
         # Retransmits can duplicate a packet already received. Keep one copy so
         # duplicate sequence numbers cannot confuse gap detection/reassembly.
-        if not any(p[0] == seq for p in grp):
-            grp.append((seq, marker, payload))
+        if isinstance(grp, _VideoPacketGroup):
+            grp.add_packet(seq, marker, payload)
+            has_marker = grp.has_marker
+        else:
+            if not any(p[0] == seq for p in grp):
+                grp.append((seq, marker, payload))
+            has_marker = any(p[1] for p in grp)
 
-        if not any(p[1] for p in grp):
+        if not has_marker:
             return
         if self._video_codec != "avc":
             self._flush_group(key)
