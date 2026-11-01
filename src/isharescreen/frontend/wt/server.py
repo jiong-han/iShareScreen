@@ -677,7 +677,7 @@ class WebTransportBridge:
         # listener it sees ICMP port-unreachable and reports the WT
         # connect as ERR_CONNECTION_REFUSED without trying IPv4.
         await quic_serve(
-            host="::",
+            host="::1",
             port=self._port,
             configuration=config,
             create_protocol=lambda *a, **kw: _BridgeProtocol(
@@ -690,7 +690,7 @@ class WebTransportBridge:
         # need an explicit v4 socket.
         try:
             await quic_serve(
-                host="0.0.0.0",
+                host="127.0.0.1",
                 port=self._port,
                 configuration=config,
                 create_protocol=lambda *a, **kw: _BridgeProtocol(
@@ -807,7 +807,7 @@ class WebTransportBridge:
         app.router.add_get("/stats", stats_endpoint)
         runner = web.AppRunner(app, access_log=None)  # don't log every /stats poll
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self._port)
+        site = web.TCPSite(runner, "127.0.0.1", self._port)
         await site.start()
         self._http_runner = runner
         log.info("server cert sha256 = %s", self.cert_sha256)
