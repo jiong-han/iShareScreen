@@ -1,5 +1,10 @@
 # iShareScreen
 
+> This fork includes an opt-in **Raspberry Pi 4B / Linux desktop profile**.
+> See [Pi setup, shortcuts, validation and limitations](docs/raspberry-pi.md).
+> During stacked-PR review, use the final PR branch to get the full profile.
+> Upstream protocol work and the AGPL license are retained.
+
 Cross-platform Python client for Apple's macOS Screen Sharing **High
 Performance** mode (HEVC RExt 4:4:4 over UDP/SRTP). Renders the host
 Mac's screen in a native wgpu window with hardware decode where

@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'pi/**']
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install native import dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libgl1 libegl1 libvulkan1 libportaudio2
+      - name: Install constrained test environment
+        run: python -m pip install -c contrib/raspberry-pi/constraints.txt -e '.[test]'
+      - name: Run tests without GPU or remote host
+        run: python -m pytest -o addopts= -q -m 'not gpu'

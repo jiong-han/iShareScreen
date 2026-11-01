@@ -1,0 +1,12 @@
+# Copy to ~/.config/isharescreen/pi.ini and edit locally.
+# Never put a password in this file. iss prompts for it on each connection.
+[connection]
+host = mac.example.invalid
+username = remote-user
+
+# Optional: uncomment both settings to request a local Wayland display mode.
+# Run wlr-randr first and choose a mode actually supported by your monitor.
+# Leaving these unset preserves the current local display mode.
+# [display]
+# output = HDMI-A-1
+# mode = 2560x1440@59.951Hz
