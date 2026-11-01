@@ -24,6 +24,7 @@ from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
 from .gpu import Renderer
 from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
+from .resolution_shortcuts import ResolutionShortcuts
 
 
 # X11 keysyms for the Cmd-equivalent (Super_L / Super_R). When Ctrl→Cmd
@@ -357,6 +358,10 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
+    # A Pi terminal's local viewport is independent of the initial video size.
+    # Leave sizing to the compositor so a 1080p unlock stream cannot shrink
+    # the maximized 1440p viewer, including when the first decoded tile lands.
+    pi_maximize = os.environ.get("ISS_PI_MAXIMIZE") == "1"
     # Window hints adapted from upstream PR #28 by @sjwasko.
     # https://github.com/renegadelink/iShareScreen/pull/28
     for hint in ("WAYLAND_APP_ID", "X11_CLASS_NAME", "X11_INSTANCE_NAME"):
@@ -364,6 +369,9 @@ def run(
             glfw.window_hint_string(getattr(glfw, hint), "isharescreen")
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
+    if pi_maximize:
+        glfw.maximize_window(glfw_window)
+        log.info("Pi local viewer: maximize requested independently of video size")
     # Lock the window to the content's aspect ratio so the stream always fills
     # it edge-to-edge with no letterbox side-bars (restores pre-merge behavior;
     # the render rework dropped the lock, so on a monitor whose work-area aspect
@@ -377,7 +385,7 @@ def run(
     # whatever size/aspect the user drags the window to, so the content fills
     # edge-to-edge at any aspect — locking the aspect would stop the user from
     # freely reshaping the window (the whole point of "track window size").
-    if not dynamic:
+    if not dynamic and not pi_maximize:
         try:
             glfw.set_window_aspect_ratio(glfw_window, win_w, win_h)
             _cw0, _ch0 = glfw.get_window_size(glfw_window)
@@ -645,8 +653,30 @@ def run(
     if ctrl_as_cmd:
         log.info("input: Ctrl→Cmd remap on (set ISS_CTRL_AS_CMD=0 to disable)")
 
+    resolution_shortcuts = None
+    if os.environ.get("ISS_PI_RESOLUTION_SHORTCUTS") == "1":
+        _dynamic[0] = False  # only explicit profile requests in this entry
+
+        def release_switch_modifiers():
+            for key in (glfw.KEY_LEFT_SHIFT, glfw.KEY_RIGHT_SHIFT,
+                        glfw.KEY_LEFT_CONTROL, glfw.KEY_RIGHT_CONTROL,
+                        glfw.KEY_LEFT_ALT, glfw.KEY_RIGHT_ALT):
+                keysym = GLFW_KEY_TO_X11[key]
+                if ctrl_as_cmd and key == glfw.KEY_LEFT_CONTROL:
+                    keysym = _KEYSYM_SUPER_L
+                elif ctrl_as_cmd and key == glfw.KEY_RIGHT_CONTROL:
+                    keysym = _KEYSYM_SUPER_R
+                session.input.key_event(False, keysym)
+
+        resolution_shortcuts = ResolutionShortcuts(
+            session, release_switch_modifiers,
+            wait_for_video=os.environ.get("ISS_PI_SWITCH_WAIT_VIDEO") == "1")
+        log.info("Pi switch entry: Ctrl+Alt+Shift+1=1080p; Ctrl+Alt+Shift+2=1440p")
+
     def on_key(_w, key, _scancode, action, mods):
         if action not in (glfw.PRESS, glfw.RELEASE, glfw.REPEAT):
+            return
+        if resolution_shortcuts and resolution_shortcuts.handle_key(key, action, mods):
             return
         # Force-IDR (formerly local F12) now lives in the TUI's session
         # screen as the `f` keybinding -- it sends an `{"action":"fir"}`
@@ -686,6 +716,8 @@ def run(
         session.input.key_event(action != glfw.RELEASE, keysym)
 
     def on_char(_w, codepoint):
+        if resolution_shortcuts and resolution_shortcuts.suppress_chars:
+            return
         session.input.key_event(True, codepoint)
         session.input.key_event(False, codepoint)
 
@@ -822,6 +854,8 @@ def run(
         def on_key2(_w, key, _sc, action, mods):
             if action not in (glfw.PRESS, glfw.RELEASE, glfw.REPEAT):
                 return
+            if resolution_shortcuts and resolution_shortcuts.handle_key(key, action, mods):
+                return
             if ctrl_as_cmd:
                 if key == glfw.KEY_LEFT_CONTROL:
                     session.input.key_event(action != glfw.RELEASE, _KEYSYM_SUPER_L)
@@ -843,6 +877,8 @@ def run(
             session.input.key_event(action != glfw.RELEASE, keysym)
 
         def on_char2(_w, codepoint):
+            if resolution_shortcuts and resolution_shortcuts.suppress_chars:
+                return
             session.input.key_event(True, codepoint)
             session.input.key_event(False, codepoint)
 
@@ -952,7 +988,7 @@ def run(
             # default path.
             _sr = renderer.source_rect()
             _ccw, _cch = _sr[2], _sr[3]
-            if (not _dynamic[0]) and _ccw > 0 and _cch > 0:
+            if (not _dynamic[0]) and not pi_maximize and _ccw > 0 and _cch > 0:
                 _asp = _ccw / _cch
                 if abs(_asp - _locked_aspect[0]) > 0.01:
                     _locked_aspect[0] = _asp
@@ -1307,9 +1343,16 @@ def run(
                 log.error("send_dynamic_resolution failed: %s", e)
                 return
 
+    shortcut_title = None
     while time.monotonic() < deadline:
         session.input.note_event_pump()
         glfw.poll_events()
+        if resolution_shortcuts and resolution_shortcuts.status != shortcut_title:
+            shortcut_title = resolution_shortcuts.status
+            # GLFW/UI calls stay on this thread; the resize worker only uses
+            # the existing encrypted control connection.
+            glfw.set_window_title(
+                glfw_window, f"{title} — {shortcut_title} | Ctrl+Alt+Shift+1/2")
         _apply_pending_cursor()
         # Hide the local OS cursor only once the overlay can actually draw —
         # a shape has been uploaded (_last_cursor_img) AND a pointer position
@@ -1409,6 +1452,7 @@ def run(
 
         # Drain fresh decoded frames + upload.
         any_fresh = False
+        fresh_video_dims = None
         for ti in range(num_tiles):
             _frame_started = time.monotonic()
             tf = session.get_frame(ti)
@@ -1425,6 +1469,8 @@ def run(
             _upload_started = time.monotonic()
             renderer.upload_tile(ti, tf, slot_h)
             session.input.note_timing("upload", (time.monotonic() - _upload_started) * 1000)
+            if num_tiles == 1:
+                fresh_video_dims = (tf.width, tf.height)
             any_fresh = True
 
         # Present after a fresh upload, OR when the overlay cursor moved or
@@ -1455,8 +1501,13 @@ def run(
             session.input.note_timing("draw", _draw_ms)
             # Includes rendercanvas bookkeeping and present, not pure GPU time.
             session.input.note_timing("present_other", max(0.0, _draw_ms - _callback_ms[0]))
+            if (resolution_shortcuts is not None and resolution_shortcuts.wait_for_video
+                    and fresh_video_dims is not None and not _device_lost["v"]):
+                resolution_shortcuts.note_presented(*fresh_video_dims)
 
     log.info("desktop frontend closing")
+    if resolution_shortcuts is not None:
+        resolution_shortcuts.close()
     for sv in secondaries:
         try:
             sv.window.close()
